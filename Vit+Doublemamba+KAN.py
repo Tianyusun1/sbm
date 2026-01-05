@@ -9,7 +9,6 @@ from transformers import ViTForImageClassification
 from tqdm import tqdm
 import chardet
 import json
-from fasterkan import FasterKANLayer
 import shutil
 import time
 import safetensors.torch
@@ -17,9 +16,13 @@ import numpy as np
 from torch.utils.data import Subset
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import precision_recall_fscore_support
-from vim import MambaConfig, VMamba
-from vim_mamba_blocks import GlobalMambaBlockFromMamba, EnhancedLocalMambaBlock
+
+# ==============================================================================
+# 关键修改：导入 Chimera-KAN 2.0 的核心模块
+# (替代了原文件中定义的 MultiTaskDataset 和 ViTForMultiTaskLearningWithVIM 类)
+# ==============================================================================
 from dataset import MultiModalDataset
+from model import MultiModalChimeraKAN
 
 # 配置日志记录
 logging.basicConfig(
@@ -35,166 +38,6 @@ logging.basicConfig(
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 logger.addFilter(lambda record: record.levelno != logging.WARNING)
-
-# 定义多任务学习模型
-class ViTForMultiTaskLearningWithVIM(torch.nn.Module):
-    def __init__(self, vit_model, individual_num_labels, gender_num_labels, emotion_num_labels, mamba_config=None):
-        super().__init__()
-        self.vit = vit_model
-        hidden_size = vit_model.config.hidden_size
-
-        # 添加 Vision Mamba 模块
-        if mamba_config is None:
-            mamba_config = MambaConfig(
-                d_model=vit_model.config.hidden_size,
-                n_layers=4,
-                dt_rank='auto',
-                d_state=16,
-                expand_factor=2,
-                d_conv=4,
-                dt_min=0.001,
-                dt_max=0.1,
-                dt_init="random",
-                dt_scale=1.0,
-                rms_norm_eps=1e-5,
-                bias=False,
-                conv_bias=True,
-                inner_layernorms=False,
-                pscan=True,
-                use_cuda=torch.cuda.is_available(),
-                bidirectional=True,
-                divide_output=True
-            )
-        self.global_mamba = GlobalMambaBlockFromMamba(hidden_size)
-        self.local_mamba = EnhancedLocalMambaBlock(mamba_config, num_layers=2)
-        self.mamba_config = mamba_config
-        fusion_dim = hidden_size * 2
-
-        # 使用 FasterKANLayer 作为分类器
-        self.emotion_classifier = FasterKANLayer(
-            input_dim=fusion_dim,
-            output_dim=emotion_num_labels,
-            grid_min=-2.0,
-            grid_max=2.0,
-            num_grids=8,
-            denominator=0.33,
-            spline_weight_init_scale=0.1
-        )
-
-        self.individual_classifier = FasterKANLayer(
-            input_dim=fusion_dim,
-            output_dim=individual_num_labels,
-            grid_min=-2.0,
-            grid_max=2.0,
-            num_grids=8,
-            denominator=0.33,
-            spline_weight_init_scale=0.1
-        )
-
-        self.gender_classifier = FasterKANLayer(
-            input_dim=fusion_dim,
-            output_dim=gender_num_labels,
-            grid_min=-2.0,
-            grid_max=2.0,
-            num_grids=8,
-            denominator=0.33,
-            spline_weight_init_scale=0.1
-        )
-
-    def forward(self, pixel_values, labels=None, individual_labels=None, gender_labels=None):
-        outputs = self.vit(pixel_values=pixel_values, output_hidden_states=True)
-        sequence_output = outputs.hidden_states[-1]  # (B, N+1, D)
-
-        cls_token = sequence_output[:, 0, :].unsqueeze(1)  # (B, 1, D)
-        patch_tokens = sequence_output[:, 1:, :]  # (B, N, D)
-
-        global_feat = self.global_mamba(cls_token).squeeze(1)  # (B, D)
-        local_feat_seq = self.local_mamba(patch_tokens)  # (B, N, D)
-        local_feat = local_feat_seq.mean(dim=1)  # (B, D)
-
-        fused = torch.cat([global_feat, local_feat], dim=-1)  # (B, 2D)
-
-        emotion_logits = self.emotion_classifier(fused)
-        individual_logits = self.individual_classifier(fused)
-        gender_logits = self.gender_classifier(fused)
-
-        total_loss = None
-        if labels is not None or individual_labels is not None or gender_labels is not None:
-            loss_fct = torch.nn.CrossEntropyLoss()
-            emotion_loss = loss_fct(emotion_logits, labels) if labels is not None else 0
-            individual_loss = loss_fct(individual_logits, individual_labels) if individual_labels is not None else 0
-            gender_loss = loss_fct(gender_logits, gender_labels) if gender_labels is not None else 0
-            total_loss = emotion_loss + individual_loss + gender_loss
-
-        return {
-            "loss": total_loss,
-            "emotion_logits": emotion_logits,
-            "individual_logits": individual_logits,
-            "gender_logits": gender_logits
-        }
-
-
-# 定义数据集类
-class MultiTaskDataset(Dataset):
-    def __init__(self, image_dir, label_path, transform=None):
-        self.image_dir = image_dir
-        # 自动检测文件编码
-        with open(label_path, 'rb') as f:
-            result = chardet.detect(f.read())
-            encoding = result['encoding']
-        self.labels = pd.read_csv(label_path, encoding=encoding)
-
-        # 检查并清理标签列中的非整数值和缺失值
-        columns_to_check = [1, 2, 3]  # 假设标签列是第 2、3、4 列（索引从 0 开始）
-        self.labels = self.labels.dropna(subset=self.labels.columns[columns_to_check])
-
-        # 确保标签列中的值都是整数类型
-        for col in columns_to_check:
-            self.labels.iloc[:, col] = pd.to_numeric(self.labels.iloc[:, col], errors='coerce')
-
-        # 删除包含无效整数的行
-        self.labels = self.labels.dropna(subset=self.labels.columns[columns_to_check])
-
-        # 确保标签值在合理范围内
-        self.labels.iloc[:, 1] = self.labels.iloc[:, 1].apply(lambda x: min(max(x, 0), 4))  # 情绪分类的标签范围是 0 到 4
-        self.labels.iloc[:, 2] = self.labels.iloc[:, 2].apply(lambda x: min(max(x, 0), 58))  # 个体分类的标签范围是 0 到 58
-        self.labels.iloc[:, 3] = self.labels.iloc[:, 3].apply(lambda x: min(max(x, 0), 1))  # 性别分类的标签范围是 0 到 1
-
-        # 检查图像文件是否存在
-        valid_indices = []
-        for idx in range(len(self.labels)):
-            img_name = self.labels.iloc[idx, 0]
-            img_path = os.path.join(self.image_dir, img_name)
-            if os.path.isfile(img_path):
-                valid_indices.append(idx)
-            else:
-                logging.warning(f"Image file not found: {img_path}")
-
-        self.labels = self.labels.iloc[valid_indices].reset_index(drop=True)
-
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        img_name = self.labels.iloc[idx, 0]
-        img_path = os.path.join(self.image_dir, img_name)
-        image = Image.open(img_path).convert('RGB')  # 确保图像转换为 RGB 模式
-        if self.transform:
-            image = self.transform(image)
-        emotion_label = int(self.labels.iloc[idx, 1])
-        individual_label = int(self.labels.iloc[idx, 2])
-        gender_label = int(self.labels.iloc[idx, 3])
-        return {
-            'pixel_values': image,
-            'labels': {
-                'emotion': torch.tensor(emotion_label, dtype=torch.long),
-                'individual': torch.tensor(individual_label, dtype=torch.long),
-                'gender': torch.tensor(gender_label, dtype=torch.long)
-            }
-        }
-
 
 # 检测可用的设备
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -216,16 +59,22 @@ if __name__ == "__main__":
         transforms.Normalize(mean=mean, std=std)
     ])
 
-    # 创建数据集
-    dataset = MultiTaskDataset(
+    # ==============================================================================
+    # 关键修改 1：使用支持音频的 MultiModalDataset
+    # ==============================================================================
+    # 假设你的音频文件存放在 label_monkey 目录下的 audio 子文件夹中
+    # 如果路径不同，请修改 audio_dir
+    dataset = MultiModalDataset(
         image_dir='/home/klj/pyfile/label_monkey',
+        audio_dir='/home/klj/pyfile/label_monkey/audio',  # 新增音频路径
         label_path='/home/klj/pyfile/label_monkey/label.csv',
-        transform=transform
+        img_transform=transform
     )
 
     # 获取数据的特征和分组信息
-    X = dataset.labels
-    groups = dataset.labels.iloc[:, 4]  # 假设 group_id 是第 5 列（索引为 4）
+    # 注意：MultiModalDataset 的数据存储在 self.data 中，而不是 self.labels
+    X = dataset.data
+    groups = dataset.data.iloc[:, 4]  # 假设 group_id 是第 5 列（索引为 4）
 
     # 划分训练集和剩余数据（验证集+测试集）
     splitter = GroupShuffleSplit(test_size=0.15, n_splits=1, random_state=42)
@@ -248,12 +97,16 @@ if __name__ == "__main__":
     model_path = '/home/klj/pyfile/premodel/vit-base-patch-224-in21k'  # 替换为你的本地预训练模型路径
     vit_model = ViTForImageClassification.from_pretrained(model_path, local_files_only=True)
 
-    # 初始化多任务学习模型（集成 Vision Mamba）
-    model = ViTForMultiTaskLearningWithVIM(
+    # ==============================================================================
+    # 关键修改 2：初始化 Chimera-KAN 2.0 模型
+    # ==============================================================================
+    model = MultiModalChimeraKAN(
         vit_model=vit_model,
         individual_num_labels=59,  # 个体分类的标签数量
-        gender_num_labels=2,  # 性别分类的标签数量
-        emotion_num_labels=5  # 情感分类的标签数量
+        gender_num_labels=2,       # 性别分类的标签数量
+        emotion_num_labels=5,      # 情感分类的标签数量
+        unified_dim=768,           # 对齐维度
+        num_chimera_layers=2       # 融合层数
     )
 
     # 将模型移动到设备
@@ -276,12 +129,17 @@ if __name__ == "__main__":
         for batch in pbar:
             # 将数据移动到设备
             pixel_values = batch['pixel_values'].to(device)
+            # 关键修改：获取音频数据
+            audio_values = batch['audio_values'].to(device)
+            
             emotion_labels = batch['labels']['emotion'].to(device)
             individual_labels = batch['labels']['individual'].to(device)
             gender_labels = batch['labels']['gender'].to(device)
 
+            # 关键修改：前向传播传入音频
             outputs = model(
                 pixel_values=pixel_values,
+                audio_values=audio_values,
                 labels=emotion_labels,
                 individual_labels=individual_labels,
                 gender_labels=gender_labels
@@ -320,12 +178,15 @@ if __name__ == "__main__":
 
             for batch in val_loader:
                 pixel_values = batch['pixel_values'].to(device)
+                audio_values = batch['audio_values'].to(device) # 验证集也需要音频
+                
                 emotion_labels = batch['labels']['emotion'].to(device)
                 individual_labels = batch['labels']['individual'].to(device)
                 gender_labels = batch['labels']['gender'].to(device)
 
                 outputs = model(
                     pixel_values=pixel_values,
+                    audio_values=audio_values,
                     labels=emotion_labels,
                     individual_labels=individual_labels,
                     gender_labels=gender_labels  # 计算验证集的损失
@@ -379,17 +240,18 @@ if __name__ == "__main__":
         model.train()
 
     # 创建保存目录
-    save_dir = "Multi_Model_with_VIM"
+    save_dir = "Multi_Model_with_Chimera_V2" # 修改保存目录名以示区分
     os.makedirs(save_dir, exist_ok=True)
     model_weights_path = os.path.join(save_dir, "model.safetensors")
     safetensors.torch.save_file(model.state_dict(), model_weights_path)
 
-    # 生成配置文件时包含 Vision Mamba 的信息
+    # 生成配置文件时包含 Chimera 的信息
+    # 完整保留你要求的字典映射
     complete_config = {
         "architectures": [model.__class__.__name__],
         "attention_probs_dropout_prob": model.vit.config.attention_probs_dropout_prob,
         "encoder_stride": model.vit.config.encoder_stride,
-        "finetuning_task": "multi-task-learning",
+        "finetuning_task": "multi-task-learning-chimera-v2",
         "hidden_act": model.vit.config.hidden_act,
         "hidden_dropout_prob": model.vit.config.hidden_dropout_prob,
         "hidden_size": model.vit.config.hidden_size,
@@ -549,27 +411,12 @@ if __name__ == "__main__":
             "Female": "0",
             "Male": "1"
         },
-        # 添加 Vision Mamba 的配置信息
-        "mamba_config": {
-            "d_model": model.mamba_config.d_model,
-            "n_layers": model.mamba_config.n_layers,
-            "dt_rank": model.mamba_config.dt_rank,
-            "d_state": model.mamba_config.d_state,
-            "expand_factor": model.mamba_config.expand_factor,
-            "d_conv": model.mamba_config.d_conv,
-            "dt_min": model.mamba_config.dt_min,
-            "dt_max": model.mamba_config.dt_max,
-            "dt_init": model.mamba_config.dt_init,
-            "dt_scale": model.mamba_config.dt_scale,
-            "rms_norm_eps": model.mamba_config.rms_norm_eps,
-            "bias": model.mamba_config.bias,
-            "conv_bias": model.mamba_config.conv_bias,
-            "inner_layernorms": model.mamba_config.inner_layernorms,
-            "pscan": model.mamba_config.pscan,
-            "use_cuda": model.mamba_config.use_cuda,
-            "bidirectional": model.mamba_config.bidirectional,
-            "divide_output": model.mamba_config.divide_output
-        }
+        # 更新配置信息，体现创新点
+        "innovations": [
+            "Inverse-KAN Audio Hallucination",
+            "Acoustic-Guided Mamba Scanning",
+            "Orthogonal Subspace Projection"
+        ]
     }
 
     config_path = os.path.join(save_dir, "config.json")
@@ -626,11 +473,13 @@ if __name__ == "__main__":
 
         for batch in test_loader:
             pixel_values = batch['pixel_values'].to(device)
+            audio_values = batch['audio_values'].to(device) # 测试集加入音频
+
             emotion_labels = batch['labels']['emotion'].to(device)
             individual_labels = batch['labels']['individual'].to(device)
             gender_labels = batch['labels']['gender'].to(device)
 
-            outputs = model(pixel_values=pixel_values)
+            outputs = model(pixel_values=pixel_values, audio_values=audio_values)
             emotion_logits = outputs['emotion_logits']
             individual_logits = outputs['individual_logits']
             gender_logits = outputs['gender_logits']
